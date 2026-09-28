@@ -143,6 +143,8 @@ def main():
     parser.add_argument('--start-step', type=int, default=0)
     parser.add_argument('--start-chunk', type=int, default=0,
                         help='이 청크 인덱스(1-based)부터 학습 재개. 0이면 처음부터')
+    parser.add_argument('--max-chunks', type=int, default=0,
+                        help='처리할 최대 청크 수 (0=전체, smoke test용)')
     parser.add_argument('--trading-fee', type=float, default=0.00015,
                         help='ETF 편도 수수료 (0.015%%)')
     parser.add_argument('--trading-tax', type=float, default=0.0,
@@ -155,6 +157,12 @@ def main():
     parser.add_argument('--output-dir', type=str, default='output/train')
     parser.add_argument('--val-start', type=int, default=-1,
                         help='Validation 데이터 시작 스텝 (-1=비활성)')
+    parser.add_argument('--train-end-date', type=str, default=None,
+                        help='날짜 기준 학습 종료일 YYYYMMDD (분봉 데이터셋용)')
+    parser.add_argument('--validation-start-date', type=str, default=None,
+                        help='날짜 기준 Validation 시작일 YYYYMMDD')
+    parser.add_argument('--validation-end-date', type=str, default=None,
+                        help='날짜 기준 Validation 종료일 YYYYMMDD')
     parser.add_argument('--clean-run', action='store_true',
                         help='기존 output 디렉토리를 삭제하고 처음부터 학습')
     parser.add_argument('--update', action='store_true',
@@ -184,6 +192,14 @@ def main():
     parser.add_argument('--reward-terminal-scale', type=float, default=30.0)
     parser.add_argument('--inaction-penalty', type=float, default=10.0)
     parser.add_argument('--hold-threshold', type=float, default=0.2)
+    parser.add_argument('--rebalance-interval-bars', type=int, default=None,
+                        help='최소 재조정 간격(분봉 bar 수, None=환경 기본값)')
+    parser.add_argument('--max-position-change', type=float, default=None,
+                        help='한 번에 변경 가능한 최대 포지션 비율')
+    parser.add_argument('--turnover-penalty-scale', type=float, default=None,
+                        help='거래 회전율 페널티 배율')
+    parser.add_argument('--flat-at-session-end', action='store_true',
+                        help='각 거래일 장 마감에 포지션 청산')
     parser.add_argument('--reward-clip', type=float, default=5.0)
     parser.add_argument('--drawdown-penalty-scale', type=float, default=25.0,
                         help='낙폭 패널티 강도 (0=비활성)')
@@ -384,7 +400,10 @@ def train_day(args, env_data_full, training_data_full, device):
             print(f"  모델 로드: {model_path}")
             print(f"  학습률 조정: {lr} (×{args.update_lr_scale})")
         else:
-            print(f"  모델 파일 없음 ({model_path}) - 처음부터 학습")
+            raise FileNotFoundError(
+                f"추가 학습 모델을 찾을 수 없습니다: {model_path}. "
+                "처음부터 학습하려면 --update를 제거하세요."
+            )
 
     # 경로
     log_dir = args.log_dir if os.path.isabs(args.log_dir) \
@@ -436,11 +455,32 @@ def train_swing(args, env_data_full, training_data_full, device):
     print("ETF Swing Trading 강화학습 (PPO)")
     print("=" * 80)
 
-    total_len = len(env_data_full)
+    full_total_len = len(env_data_full)
+    source_env_data = env_data_full
+    source_training_data = training_data_full
+
+    # 분봉 데이터셋은 종목별로 정렬되어 있으므로 단순 global row offset으로
+    # validation을 자르면 마지막 ETF만 검증하게 된다. 날짜 필터를 먼저 적용해
+    # 모든 ETF의 동일한 시장 구간을 학습에 사용한다.
+    if args.train_end_date and 'date' in env_data_full.columns:
+        date_values = env_data_full['date'].astype(str).str.zfill(8)
+        train_mask = date_values.le(str(args.train_end_date).zfill(8)).to_numpy()
+        if train_mask.sum() < 60:
+            raise ValueError(
+                f"학습 종료일 이전 데이터가 너무 짧습니다: {args.train_end_date}"
+            )
+        source_env_data = env_data_full.loc[train_mask].reset_index(drop=True)
+        source_training_data = training_data_full[train_mask]
+        print(
+            f"\n날짜 분할 학습: {date_values.iloc[0]}~{args.train_end_date} "
+            f"({len(source_env_data):,}행)"
+        )
+
+    total_len = len(source_env_data)
     start = args.start_step
     end = min(start + args.max_steps, total_len) if args.max_steps > 0 else total_len
-    env_data = env_data_full.iloc[start:end].reset_index(drop=True)
-    training_data = training_data_full[start:end]
+    env_data = source_env_data.iloc[start:end].reset_index(drop=True)
+    training_data = source_training_data[start:end]
     if start > 0 or end < total_len:
         print(f"\n슬라이싱: [{start}:{end}] ({total_len:,} → {len(env_data):,})")
 
@@ -492,6 +532,9 @@ def train_swing(args, env_data_full, training_data_full, device):
             print(f"  Chunk {idx+1}: {ec} [{df}~{dt}] ({ce-cs:,} days)")
         if len(chunks) > 10:
             print(f"  ... 외 {len(chunks)-10}개")
+        if args.max_chunks > 0:
+            chunks = chunks[:args.max_chunks]
+            print(f"  Smoke/부분 학습: 앞 {len(chunks)}개 청크만 처리")
     else:
         chunks = [(0, len(env_data), 'all',
                    str(env_data['date'].iloc[0]) if 'date' in env_data.columns else '',
@@ -500,10 +543,36 @@ def train_swing(args, env_data_full, training_data_full, device):
 
     # ── Validation 환경 ──
     val_env = None
-    if args.val_start >= 0:
+    val_env_data = None
+    val_training_data = None
+
+    if args.validation_start_date:
+        if not args.train_end_date or args.validation_start_date <= args.train_end_date:
+            raise ValueError('날짜 검증은 학습 종료일보다 뒤에서 시작해야 합니다.')
+        if not args.validation_end_date or args.validation_end_date < args.validation_start_date:
+            raise ValueError('유효한 validation 종료일을 지정하세요.')
+
+    if args.validation_start_date and 'date' in env_data_full.columns:
+        full_dates = env_data_full['date'].astype(str).str.zfill(8)
+        val_start_date = str(args.validation_start_date).zfill(8)
+        val_end_date = str(args.validation_end_date or full_dates.iloc[-1]).zfill(8)
+        val_mask = full_dates.ge(val_start_date) & full_dates.le(val_end_date)
+        if int(val_mask.sum()) >= 60:
+            val_env_data = env_data_full.loc[val_mask].reset_index(drop=True)
+            val_training_data = training_data_full[val_mask.to_numpy()]
+            print(
+                f"\nValidation 날짜 구간: {val_start_date}~{val_end_date} "
+                f"({len(val_env_data):,}행)"
+            )
+        else:
+            print(
+                f"\nValidation 날짜 구간이 너무 짧아 비활성화: "
+                f"{val_start_date}~{val_end_date}"
+            )
+    elif args.val_start >= 0:
         val_start_abs = args.val_start
-        val_end = min(val_start_abs + args.max_steps, total_len) \
-            if args.max_steps > 0 else total_len
+        val_end = min(val_start_abs + args.max_steps, full_total_len) \
+            if args.max_steps > 0 else full_total_len
         if val_end - val_start_abs >= 60:
             has_overlap = not (val_end <= start or val_start_abs >= end)
             if has_overlap:
@@ -511,27 +580,33 @@ def train_swing(args, env_data_full, training_data_full, device):
             else:
                 val_env_data = env_data_full.iloc[val_start_abs:val_end].reset_index(drop=True)
                 val_training_data = training_data_full[val_start_abs:val_end]
-                val_env = SwingTradingEnvironment(
-                    env_data=val_env_data,
-                    training_data=val_training_data,
-                    initial_balance=args.initial_balance,
-                    trading_fee=args.trading_fee,
-                    trading_tax=args.trading_tax,
-                    slippage=args.slippage,
-                    action_scale=args.action_scale,
-                    reward_clip=args.reward_clip,
-                    reward_scale=args.reward_scale,
-                    fee_penalty_scale=args.fee_penalty_scale,
-                    reward_terminal_scale=args.reward_terminal_scale,
-                    inaction_penalty=args.inaction_penalty,
-                    hold_threshold=args.hold_threshold,
-                    drawdown_penalty_scale=args.drawdown_penalty_scale,
-                    drawdown_penalty_threshold=args.drawdown_penalty_threshold,
-                    rolling_sharpe_window=args.rolling_sharpe_window,
-                    rolling_sharpe_scale=args.rolling_sharpe_scale,
-                    loss_aversion=args.loss_aversion,
-                )
                 print(f"\n  Validation: [{val_start_abs}:{val_end}] ({val_end - val_start_abs:,}일)")
+
+    if val_env_data is not None and val_training_data is not None:
+        val_env = SwingTradingEnvironment(
+            env_data=val_env_data,
+            training_data=val_training_data,
+            initial_balance=args.initial_balance,
+            trading_fee=args.trading_fee,
+            trading_tax=args.trading_tax,
+            slippage=args.slippage,
+            action_scale=args.action_scale,
+            reward_clip=args.reward_clip,
+            reward_scale=args.reward_scale,
+            fee_penalty_scale=args.fee_penalty_scale,
+            reward_terminal_scale=args.reward_terminal_scale,
+            inaction_penalty=args.inaction_penalty,
+            hold_threshold=args.hold_threshold,
+            drawdown_penalty_scale=args.drawdown_penalty_scale,
+            drawdown_penalty_threshold=args.drawdown_penalty_threshold,
+            rolling_sharpe_window=args.rolling_sharpe_window,
+            rolling_sharpe_scale=args.rolling_sharpe_scale,
+            loss_aversion=args.loss_aversion,
+            rebalance_interval_bars=args.rebalance_interval_bars,
+            max_position_change=args.max_position_change,
+            turnover_penalty_scale=args.turnover_penalty_scale,
+            flat_at_session_end=args.flat_at_session_end,
+        )
 
     # ── 신경망 & 에이전트 (전체 청크에서 공유) ──
     # 첫 번째 청크로 input_dim 결정
@@ -589,9 +664,14 @@ def train_swing(args, env_data_full, training_data_full, device):
                 print(f"  정책 모델 로드: {policy_path}")
                 print(f"  가치 모델 로드: {value_path}")
             except Exception as e:
-                print(f"  모델 로드 실패: {e}")
+                raise RuntimeError(
+                    f"추가 학습 모델을 불러오지 못했습니다: {policy_path}, {value_path}"
+                ) from e
         else:
-            print(f"  모델 파일 없음 - 새로운 모델로 학습")
+            raise FileNotFoundError(
+                f"추가 학습 모델을 찾을 수 없습니다: {policy_path}, {value_path}. "
+                "처음부터 학습하려면 --update를 제거하세요."
+            )
 
     # ── 경로 설정 ──
     iteration_name = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -614,9 +694,14 @@ def train_swing(args, env_data_full, training_data_full, device):
         "lr_policy": args.lr_policy,
         "lr_value": args.lr_value,
         "chunk_years": args.chunk_years,
+        "max_chunks": args.max_chunks,
         "val_start": args.val_start,
+        "train_end_date": args.train_end_date,
+        "validation_start_date": args.validation_start_date,
+        "validation_end_date": args.validation_end_date,
         "data_length": len(env_data_full),
-        "base_model": args.base_model,
+        "train_data_length": len(env_data),
+        "base_model": args.base_model if args.update else None,
         "drawdown_penalty_scale": args.drawdown_penalty_scale,
         "drawdown_penalty_threshold": args.drawdown_penalty_threshold,
         "rolling_sharpe_window": args.rolling_sharpe_window,
@@ -624,6 +709,10 @@ def train_swing(args, env_data_full, training_data_full, device):
         "loss_aversion": args.loss_aversion,
         "hold_threshold": args.hold_threshold,
         "min_concentration": args.min_concentration,
+        "rebalance_interval_bars": args.rebalance_interval_bars,
+        "max_position_change": args.max_position_change,
+        "turnover_penalty_scale": args.turnover_penalty_scale,
+        "flat_at_session_end": args.flat_at_session_end,
         "gamma": args.gamma,
         "network_type": args.network_type,
         "d_model": args.d_model,
@@ -679,17 +768,19 @@ def train_swing(args, env_data_full, training_data_full, device):
             rolling_sharpe_window=args.rolling_sharpe_window,
             rolling_sharpe_scale=args.rolling_sharpe_scale,
             loss_aversion=args.loss_aversion,
+            rebalance_interval_bars=args.rebalance_interval_bars,
+            max_position_change=args.max_position_change,
+            turnover_penalty_scale=args.turnover_penalty_scale,
+            flat_at_session_end=args.flat_at_session_end,
         )
 
         # 통계
         closes = chunk_env.env_data['close'].values
-        daily_rets = np.diff(closes) / (closes[:-1] + 1e-8)
-        bnh_return = float((closes[-1] / closes[0] - 1) * 100)
-        avg_ret = float(daily_rets.mean()) * 100
-        win_days = int((daily_rets > 0).sum())
-        total_days = len(closes)
+        intraday_stats = chunk_env.get_stats()
+        bnh_return = float(intraday_stats.get('bnh_return', 0.0))
+        total_bars = len(closes)
 
-        print(f"  - 거래일 수: {chunk_env.total_ticks:,}일, B&H: {bnh_return:+.2f}%")
+        print(f"  - 분봉 수: {total_bars:,}개, 장중 B&H: {bnh_return:+.2f}%")
 
         chunk_info = {
             'iteration_name': iteration_name,

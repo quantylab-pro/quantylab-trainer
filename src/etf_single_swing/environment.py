@@ -421,6 +421,10 @@ class SwingTradingEnvironment:
         rolling_sharpe_window: int = 20,  # 롤링 Sharpe 윈도우
         rolling_sharpe_scale: float = 0.0,  # 롤링 Sharpe 보너스 강도 (0=비활성)
         loss_aversion: float = 1.0,  # 손실 비대칭 배율 (>1: 손실 패널티 강화)
+        rebalance_interval_bars: int = 1,  # 최소 재조정 간격 (분봉 기준 bar 수)
+        max_position_change: float = 1.0,  # 한 번에 변경 가능한 최대 비중
+        turnover_penalty_scale: float = 0.0,  # 거래대금/자산 회전율 페널티
+        flat_at_session_end: bool = False,  # 장 마감에 보유 포지션 청산
     ):
         self.env_data = env_data.reset_index(drop=True)
         self.training_data = training_data
@@ -441,6 +445,14 @@ class SwingTradingEnvironment:
         self.rolling_sharpe_window = rolling_sharpe_window
         self.rolling_sharpe_scale = rolling_sharpe_scale
         self.loss_aversion = loss_aversion
+        self.rebalance_interval_bars = max(int(rebalance_interval_bars or 1), 1)
+        self.max_position_change = float(np.clip(
+            1.0 if max_position_change is None else max_position_change, 0.0, 1.0
+        ))
+        self.turnover_penalty_scale = max(
+            float(turnover_penalty_scale or 0.0), 0.0
+        )
+        self.flat_at_session_end = bool(flat_at_session_end or False)
 
         assert len(self.env_data) == len(self.training_data), \
             "환경 데이터와 학습 데이터의 길이가 일치하지 않습니다."
@@ -485,6 +497,9 @@ class SwingTradingEnvironment:
         self.consecutive_wins = 0
         self.consecutive_losses = 0
         self.daily_returns = []
+        self.session_returns = []
+        self.session_start_value = self.initial_balance
+        self.last_trade_tick = -10**9
 
         return self._get_state()
 
@@ -559,6 +574,21 @@ class SwingTradingEnvironment:
         """
         target_ratio = float(np.clip(target_ratio, 0.0, 1.0))
 
+        # 현재 분봉이 세션의 마지막 봉인지 확인한다. 분봉 데이터에서는
+        # 다음 행의 날짜가 바뀌는 지점이 장 마감이며, 마지막 데이터 행도
+        # 세션 종료로 취급한다.
+        current_date = self.env_data.loc[self.tick, 'date'] if 'date' in self.env_data.columns else None
+        next_date = self.env_data.loc[self.tick + 1, 'date'] \
+            if self.tick + 1 < self.total_ticks and 'date' in self.env_data.columns else None
+        current_code = self.env_data.loc[self.tick, 'etf_code'] if 'etf_code' in self.env_data.columns else None
+        next_code = self.env_data.loc[self.tick + 1, 'etf_code'] \
+            if self.tick + 1 < self.total_ticks and 'etf_code' in self.env_data.columns else None
+        session_end = self.tick + 1 >= self.total_ticks or (
+            current_date is not None and next_date is not None and (
+                current_date != next_date or current_code != next_code
+            )
+        )
+
         if self.action_scale != 1.0:
             target_ratio = 0.5 + (target_ratio - 0.5) * self.action_scale
             target_ratio = float(np.clip(target_ratio, 0.0, 1.0))
@@ -592,6 +622,7 @@ class SwingTradingEnvironment:
             self.balance = self.initial_balance
             self.portfolio_value = self.initial_balance
             self.peak_portfolio_value = max(self.peak_portfolio_value, self.portfolio_value)
+            self.session_start_value = self.initial_balance
 
         open_price = self.env_data.loc[self.tick, 'open']
         close_price = self.env_data.loc[self.tick, 'close']
@@ -604,7 +635,21 @@ class SwingTradingEnvironment:
         current_ratio = stock_value_at_open / (prev_pv + 1e-8) if prev_pv > 0 else 0.0
 
         # 비율 차이 계산
-        ratio_diff = target_ratio - current_ratio
+        # 분봉에서는 매 바의 정책 노이즈가 바로 매매로 이어지지 않도록
+        # 재조정 간격과 한 번의 최대 비중 변화를 제한한다.
+        trade_allowed = (
+            self.tick - self.last_trade_tick >= self.rebalance_interval_bars
+            and not (self.flat_at_session_end and session_end)
+        )
+        if trade_allowed:
+            bounded_target = current_ratio + np.clip(
+                target_ratio - current_ratio,
+                -self.max_position_change,
+                self.max_position_change,
+            )
+        else:
+            bounded_target = current_ratio
+        ratio_diff = bounded_target - current_ratio
 
         # ── 시가 기준 리밸런싱 ──
         traded = False
@@ -612,7 +657,7 @@ class SwingTradingEnvironment:
         trade_amount = 0.0
 
         if abs(ratio_diff) > self.hold_threshold:
-            target_stock_value = prev_pv * target_ratio
+            target_stock_value = prev_pv * bounded_target
 
             if ratio_diff > 0:
                 # 매수: 추가 주식 필요
@@ -638,6 +683,7 @@ class SwingTradingEnvironment:
                         trade_amount = buy_value
                         self.num_buy += 1
                         traded = True
+                        self.last_trade_tick = self.tick
                         date = self.env_data.loc[self.tick, 'date'] if 'date' in self.env_data.columns else self.tick
                         code = self.env_data.loc[self.tick, 'etf_code'] if 'etf_code' in self.env_data.columns else ''
                         self.trade_log.append({
@@ -668,6 +714,7 @@ class SwingTradingEnvironment:
                     trade_amount = sell_revenue
                     self.num_sell += 1
                     traded = True
+                    self.last_trade_tick = self.tick
                     sell_return = (sell_price - self.avg_buy_price) / (self.avg_buy_price + 1e-8) * 100 if self.avg_buy_price > 0 else 0.0
                     date = self.env_data.loc[self.tick, 'date'] if 'date' in self.env_data.columns else self.tick
                     code = self.env_data.loc[self.tick, 'etf_code'] if 'etf_code' in self.env_data.columns else ''
@@ -690,6 +737,37 @@ class SwingTradingEnvironment:
         # ── 종가 기준 포트폴리오 가치 갱신 ──
         stock_value = self.num_shares * close_price
         self.portfolio_value = self.balance + stock_value
+
+        # 진짜 intraday 운용은 장 마감에 포지션을 다음 날로 넘기지 않는다.
+        # 마지막 봉의 종가에서 청산하므로 다음 세션의 첫 봉에 overnight
+        # 변동과 포지션이 섞이지 않는다.
+        if self.flat_at_session_end and session_end and self.num_shares > 0:
+            final_sell_price = close_price * (1 - self.slippage)
+            sell_revenue = self.num_shares * final_sell_price
+            sell_fee = sell_revenue * self.trading_fee
+            sell_tax = sell_revenue * self.trading_tax
+            net_revenue = sell_revenue - sell_fee - sell_tax
+            code = self.env_data.loc[self.tick, 'etf_code'] if 'etf_code' in self.env_data.columns else ''
+            date = self.env_data.loc[self.tick, 'date'] if 'date' in self.env_data.columns else self.tick
+            self.trade_log.append({
+                'date': date, 'action': 'SELL_SESSION_CLOSE', 'code': code,
+                'name': TARGET_ETFS.get(str(code).zfill(6), ''),
+                'shares': self.num_shares, 'price': final_sell_price,
+                'amount': sell_revenue, 'fee': sell_fee + sell_tax,
+                'balance': self.balance + net_revenue,
+                'portfolio_value': self.balance + net_revenue,
+                'sell_return_pct': 0.0,
+            })
+            self.balance += net_revenue
+            self.num_shares = 0.0
+            self.avg_buy_price = 0.0
+            self.num_sell += 1
+            self.total_trade_amount += sell_revenue
+            trade_amount += sell_revenue
+            self.total_fee_paid += sell_fee + sell_tax
+            fee_paid += sell_fee + sell_tax
+            self.portfolio_value = self.balance
+
         self.peak_portfolio_value = max(self.peak_portfolio_value, self.portfolio_value)
         self.pv_history.append(self.portfolio_value)
 
@@ -699,6 +777,12 @@ class SwingTradingEnvironment:
         # ── 일간 수익률 기록 ──
         day_return = (self.portfolio_value - prev_pv) / (prev_pv + 1e-8)
         self.daily_returns.append(day_return)
+        if session_end:
+            session_return = (
+                self.portfolio_value - self.session_start_value
+            ) / (self.session_start_value + 1e-8)
+            self.session_returns.append(float(session_return))
+            self.session_start_value = self.portfolio_value
 
         if day_return > 0:
             self.consecutive_wins += 1
@@ -720,6 +804,10 @@ class SwingTradingEnvironment:
         if fee_paid > 0:
             fee_ratio = fee_paid / (prev_pv + 1e-8)
             reward -= fee_ratio * self.fee_penalty_scale
+
+        # 수수료만으로 잡히지 않는 과도한 회전율도 직접 억제한다.
+        if self.turnover_penalty_scale > 0 and trade_amount > 0:
+            reward -= (trade_amount / (prev_pv + 1e-8)) * self.turnover_penalty_scale
 
         # ── 포지션 인식 낙폭 패널티: 주식 비중이 높을수록 하락 패널티 증폭 ──
         if self.drawdown_penalty_scale > 0:
@@ -775,8 +863,9 @@ class SwingTradingEnvironment:
             total_days = max(self.total_ticks, 1)
             cagr = float((1.0 + episode_return) ** (252.0 / total_days) - 1.0)
 
-            if len(self.daily_returns) > 5:
-                dr = np.array(self.daily_returns)
+            terminal_returns = self.session_returns if self.flat_at_session_end else self.daily_returns
+            if len(terminal_returns) > 5:
+                dr = np.array(terminal_returns)
                 sharpe_sign = dr.mean() / (dr.std() + 1e-8)
                 sharpe_weight = 0.3 if self.drawdown_penalty_scale > 0 else 0.1
 

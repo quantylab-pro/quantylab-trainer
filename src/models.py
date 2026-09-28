@@ -1983,6 +1983,8 @@ class EtfPortfolioPaperTradeOrder(Base, TimestampMixin):
     filled_price: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     filled_amount: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     filled_at: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    cost_basis_price: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    realized_return_pct: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     final_status: Mapped[Optional[str]] = mapped_column(String, nullable=True)
     raw_response: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
 
